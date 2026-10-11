@@ -1,0 +1,17 @@
+#
+# Grim-Batol/mod-autoloot server configuration
+#
+
+[worldserver]
+
+########################################
+# AutoLoot Configuration
+########################################
+#
+#    AutoLoot.Enable
+#        Description: Automatically collect loot when the player is
+#                     eligible under AzerothCore's normal corpse/group rules.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+AutoLoot.Enable = 0

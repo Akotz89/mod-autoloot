@@ -15,7 +15,9 @@
 #include "ScriptMgr.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
+#include "World.h"
 
+#include <limits>
 #include <vector>
 
 namespace
@@ -50,14 +52,9 @@ std::vector<Player*> FindEligibleTargets(Player* creditedPlayer, Creature* victi
 
     auto isEligible = [&config, victim](Player* player)
     {
-        if (!config.IsTarget(player) || !player->IsInWorld() || player->GetMap() != victim->GetMap() ||
-            !player->IsAtLootRewardDistance(victim))
-            return false;
-
-        // Each party member has an independent quest/FFA/conditional loot
-        // view. Build it before asking the core whether that member can loot.
-        victim->loot.FillNotNormalLootFor(player);
-        return player->isAllowedToLoot(victim);
+        return config.IsTarget(player) && !player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME) &&
+            player->IsInWorld() && player->GetMap() == victim->GetMap() &&
+            player->IsAtLootRewardDistance(victim) && player->isAllowedToLoot(victim);
     };
 
     std::vector<Player*> targets;
@@ -131,9 +128,16 @@ void AutoLootMoney(Player* player, Creature* victim)
         return;
 
     sScriptMgr->OnPlayerBeforeLootMoney(player, loot);
-    loot->NotifyMoneyRemoved();
 
+    struct Payment
+    {
+        Player* recipient;
+        uint32 amount;
+        uint32 previousMoney;
+    };
+    std::vector<Payment> payments;
     uint32 goldPerPlayer = uint32(loot->gold / playersNear.size());
+    uint32 trialMoneyCap = sWorld->getIntConfig(CONFIG_TRIAL_MONEY_CAP);
     for (Player* member : playersNear)
     {
         if (member->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
@@ -142,29 +146,47 @@ void AutoLootMoney(Player* player, Creature* victim)
         uint32 finalGold = goldPerPlayer;
         if (member->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
             finalGold /= 2;
-
         if (!finalGold)
             continue;
 
-        member->ModifyMoney(finalGold);
-        member->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, finalGold);
-
-        WorldPacket data(SMSG_LOOT_MONEY_NOTIFY, 4 + 1);
-        data << uint32(finalGold);
-        data << uint8(playersNear.size() > 1 ? 0 : 1);
-        member->SendDirectMessage(&data);
+        uint64 total = uint64(member->GetMoney()) + finalGold;
+        if (finalGold > uint32(std::numeric_limits<int32>::max()) || total >= uint64(MAX_MONEY_AMOUNT) ||
+            (trialMoneyCap && member->GetSession()->IsTrialAccount() && total > trialMoneyCap))
+        {
+            member->SendEquipError(EQUIP_ERR_TOO_MUCH_GOLD, nullptr, nullptr);
+            return;
+        }
+        payments.push_back({ member, finalGold, member->GetMoney() });
     }
+    if (payments.empty())
+        return;
+
+    // shortcut: custom money hooks need transactional payouts; SetMoney cannot undo their external/achievement effects.
+    for (Payment const& payment : payments)
+        if (!payment.recipient->ModifyMoney(int32(payment.amount)))
+        {
+            for (Payment const& rollback : payments)
+                if (rollback.recipient->GetMoney() != rollback.previousMoney)
+                    rollback.recipient->SetMoney(rollback.previousMoney);
+            return;
+        }
 
     loot->gold = 0;
+    loot->NotifyMoneyRemoved();
+    for (Payment const& payment : payments)
+    {
+        payment.recipient->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, payment.amount);
+        WorldPacket data(SMSG_LOOT_MONEY_NOTIFY, 4 + 1);
+        data << uint32(payment.amount);
+        data << uint8(playersNear.size() > 1 ? 0 : 1);
+        payment.recipient->SendDirectMessage(&data);
+    }
+
 }
 
 void AutoLootItems(Player* player, Creature* victim)
 {
     Loot* loot = &victim->loot;
-    // The client fills the per-player quest/FFA/conditional lists while
-    // opening the loot window. Server-side auto-loot has no such window, so
-    // prepare the same core view before calculating the slot range.
-    loot->FillNotNormalLootFor(player);
     uint32 itemCount = uint32(loot->items.size());
     uint32 maxSlot = loot->GetMaxSlotInLootFor(player);
 
@@ -174,6 +196,10 @@ void AutoLootItems(Player* player, Creature* victim)
         // same StoreLootItem path as a normal client loot request.
         if (slot >= itemCount)
         {
+            LootItem* item = loot->LootItemInSlot(slot, player);
+            if (!item || (item->follow_loot_rules && item->is_blocked))
+                continue;
+
             InventoryResult result;
             player->StoreLootItem(uint8(slot), loot, result);
             continue;
@@ -185,6 +211,15 @@ void AutoLootItems(Player* player, Creature* victim)
 
         // Round-robin, master-loot, and completed group-roll allocations must
         // remain available to the player or companion selected by the core.
+        if (Group* group = player->GetGroup())
+            if (!item.freeforall && item.conditions.empty() && loot->roundRobinPlayer &&
+                loot->roundRobinPlayer != player->GetGUID() &&
+                (group->GetLootMethod() == ROUND_ROBIN ||
+                 (item.is_underthreshold && (group->GetLootMethod() == GROUP_LOOT ||
+                                            group->GetLootMethod() == NEED_BEFORE_GREED ||
+                                            group->GetLootMethod() == MASTER_LOOT))))
+                continue;
+
         AllowedLooterSet const& allowedLooters = item.GetAllowedLooters();
         if (!allowedLooters.empty() && !allowedLooters.count(player->GetGUID()))
             continue;
@@ -204,9 +239,6 @@ void AutoLootCreature(Player* creditedPlayer, Creature* victim)
         return;
 
     Loot* loot = &victim->loot;
-    for (Player* player : players)
-        loot->FillNotNormalLootFor(player);
-
     if (loot->isLooted())
         return;
 
