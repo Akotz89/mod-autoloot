@@ -19,6 +19,7 @@
 
 #include <limits>
 #include <vector>
+#include "LootReceipt.h"
 
 namespace
 {
@@ -108,6 +109,7 @@ void AutoLootMoney(Player* player, Creature* victim)
     if (!loot->gold || player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
         return;
 
+    LootReceipt::Money receipt("autoloot", loot, player);
     Group* group = player->GetGroup();
     std::vector<Player*> playersNear;
 
@@ -125,9 +127,17 @@ void AutoLootMoney(Player* player, Creature* victim)
 
     // Never destroy money if the core cannot identify an eligible recipient.
     if (playersNear.empty())
+    {
+        receipt.Recipients(playersNear);
+        receipt.Balances(playersNear);
+        receipt.End("no_recipients", loot->gold);
         return;
+    }
 
     sScriptMgr->OnPlayerBeforeLootMoney(player, loot);
+    receipt.Post(loot->gold);
+
+    receipt.Recipients(playersNear);
 
     struct Payment
     {
@@ -137,40 +147,68 @@ void AutoLootMoney(Player* player, Creature* victim)
     };
     std::vector<Payment> payments;
     uint32 goldPerPlayer = uint32(loot->gold / playersNear.size());
+    LootReceipt::Emit("loot_v1 money_share op={} gold={} count={} share={} remainder={}", receipt.id, loot->gold, playersNear.size(), goldPerPlayer, loot->gold % playersNear.size());
     uint32 trialMoneyCap = sWorld->getIntConfig(CONFIG_TRIAL_MONEY_CAP);
     for (Player* member : playersNear)
     {
         if (member->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
+        {
+            LootReceipt::Emit("loot_v1 money_skip op={} guid={} reason=no_play_time", receipt.id, member->GetGUID().GetRawValue());
             continue;
+        }
 
         uint32 finalGold = goldPerPlayer;
         if (member->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
             finalGold /= 2;
         if (!finalGold)
+        {
+            LootReceipt::Emit("loot_v1 money_skip op={} guid={} reason=zero_share", receipt.id, member->GetGUID().GetRawValue());
             continue;
+        }
 
         uint64 total = uint64(member->GetMoney()) + finalGold;
         if (finalGold > uint32(std::numeric_limits<int32>::max()) || total >= uint64(MAX_MONEY_AMOUNT) ||
             (trialMoneyCap && member->GetSession()->IsTrialAccount() && total > trialMoneyCap))
         {
             member->SendEquipError(EQUIP_ERR_TOO_MUCH_GOLD, nullptr, nullptr);
+            receipt.Balances(playersNear);
+            receipt.End("preflight_refused", loot->gold);
             return;
         }
+        LootReceipt::Emit("loot_v1 money_plan op={} guid={} amount={}", receipt.id, member->GetGUID().GetRawValue(), finalGold);
         payments.push_back({ member, finalGold, member->GetMoney() });
     }
     if (payments.empty())
+    {
+        receipt.Balances(playersNear);
+        receipt.End("no_payments", loot->gold);
         return;
+    }
 
     // shortcut: custom money hooks need transactional payouts; SetMoney cannot undo their external/achievement effects.
     for (Payment const& payment : payments)
-        if (!payment.recipient->ModifyMoney(int32(payment.amount)))
+    {
+        uint32 const receiptBefore = payment.recipient->GetMoney();
+        bool const receiptAccepted = payment.recipient->ModifyMoney(int32(payment.amount));
+        receipt.Credit(payment.recipient->GetGUID().GetRawValue(), payment.amount,
+            receiptBefore, payment.recipient->GetMoney(), receiptAccepted, "modify");
+        if (!receiptAccepted)
         {
             for (Payment const& rollback : payments)
                 if (rollback.recipient->GetMoney() != rollback.previousMoney)
+                {
+                    uint32 const receiptRollbackBefore = rollback.recipient->GetMoney();
                     rollback.recipient->SetMoney(rollback.previousMoney);
+                    receipt.Credit(rollback.recipient->GetGUID().GetRawValue(), 0,
+                        receiptRollbackBefore, rollback.recipient->GetMoney(), true, "rollback");
+                }
+            receipt.Balances(playersNear);
+            receipt.End("modify_refused_rollback", loot->gold);
             return;
         }
+    }
 
+    uint32 const receiptRemoved = loot->gold;
     loot->gold = 0;
     loot->NotifyMoneyRemoved();
     for (Payment const& payment : payments)
@@ -181,6 +219,8 @@ void AutoLootMoney(Player* player, Creature* victim)
         data << uint8(playersNear.size() > 1 ? 0 : 1);
         payment.recipient->SendDirectMessage(&data);
     }
+    receipt.Balances(playersNear);
+    receipt.End("removed", loot->gold, receiptRemoved);
 
 }
 
